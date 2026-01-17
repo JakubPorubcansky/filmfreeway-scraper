@@ -79,11 +79,12 @@ class ChunkedJSONLWriter:
 
         return count
 
-    def _open_current_chunk(self):
+    def _open_current_chunk(self, log_message: bool = True):
         """Open the current chunk file in append mode."""
         filepath = os.path.join(self.base_dir, f"festivals_data_{self.current_chunk_num}.jsonl")
         self.file_handle = open(filepath, 'a', encoding='utf-8')
-        logging.info(f"Writing to {filepath} (current entries: {self.current_entry_count})")
+        if log_message:
+            logging.info(f"Writing to {filepath} (current entries: {self.current_entry_count})")
 
     def write(self, festival_data: Dict):
         """Write festival data, rotating to new file if current reaches chunk_size."""
@@ -92,7 +93,8 @@ class ChunkedJSONLWriter:
             self.file_handle.close()
             self.current_chunk_num += 1
             self.current_entry_count = 0
-            self._open_current_chunk()
+            # Don't log during rotation to avoid interrupting progress bar
+            self._open_current_chunk(log_message=False)
 
         # Write the data
         json.dump(festival_data, self.file_handle, ensure_ascii=False)
@@ -103,8 +105,9 @@ class ChunkedJSONLWriter:
     def close(self):
         """Close the current file handle."""
         if self.file_handle:
+            filepath = os.path.join(self.base_dir, f"festivals_data_{self.current_chunk_num}.jsonl")
             self.file_handle.close()
-            logging.info(f"Closed file with {self.current_entry_count} entries")
+            logging.info(f"Closed {filepath} with {self.current_entry_count} entries")
 
 
 # Global writer instance
@@ -558,7 +561,12 @@ def scrape_festival_details(
         time.sleep(3)  # Brief pause after initial connection
     except Exception as e:
         logging.warning(f"Could not establish initial session: {str(e)}")
-    
+
+    # Initialize chunked writer before progress bar to avoid interrupting it
+    global chunked_writer
+    if chunked_writer is None:
+        chunked_writer = ChunkedJSONLWriter(base_dir="scraped", chunk_size=10000)
+
     with tqdm(total=scrape_count, desc="Scraping festival details") as pbar:
         for idx, url in enumerate(urls[:scrape_count]):
             try:
@@ -573,7 +581,7 @@ def scrape_festival_details(
                 save_festival(festival_data)
 
                 section_count = len(festival_data.get('sections', []))
-                logging.info(
+                pbar.write(
                     f"[{idx+1}/{scrape_count}] Successfully scraped: {festival_data['title']} "
                     f"({section_count} sections)"
                 )
@@ -587,14 +595,13 @@ def scrape_festival_details(
                     time.sleep(actual_delay)
 
             except Exception as e:
-                logging.error(f"[{idx+1}/{scrape_count}] Error processing {url.strip()}: {str(e)}")
+                pbar.write(f"ERROR: [{idx+1}/{scrape_count}] Error processing {url.strip()}: {str(e)}")
                 save_festival({"url": url})
                 pbar.update(1)
                 # Continue with next festival
                 continue
 
     # Close the chunked writer
-    global chunked_writer
     if chunked_writer:
         chunked_writer.close()
         chunked_writer = None  # Reset for next run
