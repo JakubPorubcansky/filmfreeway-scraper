@@ -8,13 +8,16 @@ Compliant with robots.txt (Crawl-delay: 20)
 import time
 import argparse
 from tqdm import tqdm
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Set
 import requests
 from bs4 import BeautifulSoup
 import logging
 import random
 import json
+import glob
+import os
 from pathlib import Path
+from datetime import datetime
 
 DELAY_BETWEEN_FESTIVALS = 20
 REQUEST_TIMEOUT = 30
@@ -27,17 +30,99 @@ USER_AGENTS = [
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
 ]
 
+
+class ChunkedJSONLWriter:
+    """Manages writing to chunked JSONL files with automatic rotation at 10,000 entries."""
+
+    def __init__(self, base_dir: str = "scraped", chunk_size: int = 10000):
+        self.base_dir = base_dir
+        self.chunk_size = chunk_size
+        self.current_chunk_num = self._find_last_chunk_number()
+        self.current_entry_count = self._count_entries_in_current_chunk()
+        self.file_handle = None
+        self._open_current_chunk()
+
+    def _find_last_chunk_number(self) -> int:
+        """Find the highest chunk number from existing files."""
+        pattern = os.path.join(self.base_dir, "festivals_data_*.jsonl")
+        files = glob.glob(pattern)
+
+        if not files:
+            return 1  # Start with festivals_data_1.jsonl
+
+        # Extract numbers from filenames
+        numbers = []
+        for f in files:
+            basename = os.path.basename(f)
+            # Extract number from festivals_data_N.jsonl
+            if basename.startswith("festivals_data_") and basename.endswith(".jsonl"):
+                num_str = basename[len("festivals_data_"):-len(".jsonl")]
+                try:
+                    numbers.append(int(num_str))
+                except ValueError:
+                    continue
+
+        return max(numbers) if numbers else 1
+
+    def _count_entries_in_current_chunk(self) -> int:
+        """Count entries in the current chunk file."""
+        filepath = os.path.join(self.base_dir, f"festivals_data_{self.current_chunk_num}.jsonl")
+
+        if not os.path.exists(filepath):
+            return 0
+
+        count = 0
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    count += 1
+
+        return count
+
+    def _open_current_chunk(self):
+        """Open the current chunk file in append mode."""
+        filepath = os.path.join(self.base_dir, f"festivals_data_{self.current_chunk_num}.jsonl")
+        self.file_handle = open(filepath, 'a', encoding='utf-8')
+        logging.info(f"Writing to {filepath} (current entries: {self.current_entry_count})")
+
+    def write(self, festival_data: Dict):
+        """Write festival data, rotating to new file if current reaches chunk_size."""
+        # Check if we need to rotate to a new file
+        if self.current_entry_count >= self.chunk_size:
+            self.file_handle.close()
+            self.current_chunk_num += 1
+            self.current_entry_count = 0
+            self._open_current_chunk()
+
+        # Write the data
+        json.dump(festival_data, self.file_handle, ensure_ascii=False)
+        self.file_handle.write('\n')
+        self.file_handle.flush()  # Ensure data is written
+        self.current_entry_count += 1
+
+    def close(self):
+        """Close the current file handle."""
+        if self.file_handle:
+            self.file_handle.close()
+            logging.info(f"Closed file with {self.current_entry_count} entries")
+
+
+# Global writer instance
+chunked_writer = None
+
+
 def save_festival(festival_data: Dict, output_file: str = "festivals_data.jsonl"):
-    """Append festival data to JSONL file."""
-    with open("scraped/" + output_file, 'a', encoding='utf-8') as f:
-        json.dump(festival_data, f, ensure_ascii=False)
-        f.write('\n')
+    """Save festival data using chunked writer."""
+    global chunked_writer
+    if chunked_writer is None:
+        chunked_writer = ChunkedJSONLWriter(base_dir="scraped", chunk_size=10000)
+    chunked_writer.write(festival_data)
 
 
 def get_session() -> requests.Session:
     """Create a session with proper headers mimicking a real browser."""
     session = requests.Session()
-    
+
     # Set comprehensive browser-like headers
     session.headers.update({
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -52,8 +137,181 @@ def get_session() -> requests.Session:
         'Cache-Control': 'max-age=0',
         'TE': 'trailers',
     })
-    
+
     return session
+
+
+def fetch_sitemap_urls(sitemap_url: str = "https://filmfreeway.com/pages/sitemap_for_festivals", retry_count: int = 3) -> List[str]:
+    """Fetch sitemap and return list of festival URLs with retry logic."""
+    session = get_session()
+
+    for attempt in range(retry_count):
+        try:
+            # Rotate user agent for each attempt
+            session.headers['User-Agent'] = random.choice(USER_AGENTS)
+            session.headers['Referer'] = 'https://filmfreeway.com/'
+
+            logging.info(f"Fetching sitemap from {sitemap_url}...")
+            response = session.get(sitemap_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            response.raise_for_status()
+
+            # Parse as plain text file (one URL per line)
+            urls = [line.strip() for line in response.text.splitlines() if line.strip()]
+
+            logging.info(f"Successfully fetched {len(urls)} URLs from sitemap")
+            return urls
+
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code
+
+            if status_code == 403:
+                if attempt < retry_count - 1:
+                    wait_time = 15 * (2 ** attempt)
+                    logging.warning(
+                        f"403 Forbidden for sitemap (attempt {attempt + 1}/{retry_count}). "
+                        f"Waiting {wait_time}s before retry..."
+                    )
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logging.error(f"Failed to fetch sitemap after {retry_count} attempts: 403 Forbidden")
+                    raise
+            else:
+                logging.error(f"HTTP {status_code} error for sitemap")
+                raise
+
+        except requests.exceptions.Timeout:
+            if attempt < retry_count - 1:
+                logging.warning(f"Timeout on attempt {attempt + 1}/{retry_count} for sitemap. Retrying...")
+                time.sleep(5)
+                continue
+            else:
+                logging.error(f"Timeout after {retry_count} attempts for sitemap")
+                raise
+
+        except requests.exceptions.RequestException as e:
+            if attempt < retry_count - 1:
+                logging.warning(f"Request error on attempt {attempt + 1}/{retry_count}: {str(e)}. Retrying...")
+                time.sleep(5)
+                continue
+            else:
+                logging.error(f"Request failed after {retry_count} attempts: {str(e)}")
+                raise
+
+        except Exception as e:
+            logging.error(f"Unexpected error fetching sitemap: {str(e)}")
+            raise
+
+    return []
+
+
+def load_scraped_urls(scraped_dir: str = "scraped") -> Set[str]:
+    """Load all previously scraped URLs from all festivals_data_*.jsonl files."""
+    scraped_urls = set()
+
+    # Find all matching files
+    pattern = os.path.join(scraped_dir, "festivals_data_*.jsonl")
+    files = glob.glob(pattern)
+
+    if not files:
+        logging.info("No existing scraped files found, starting fresh")
+        return scraped_urls
+
+    # Read each file
+    for filepath in sorted(files):  # Sort for consistent logging
+        file_count = 0
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    if line.strip():
+                        try:
+                            record = json.loads(line)
+                            if 'url' in record:
+                                scraped_urls.add(record['url'].strip())
+                                file_count += 1
+                        except json.JSONDecodeError as e:
+                            logging.warning(f"Skipping malformed JSON in {filepath} at line {line_num}: {str(e)}")
+                            continue
+
+            logging.info(f"Loaded {file_count} URLs from {os.path.basename(filepath)}")
+        except Exception as e:
+            logging.error(f"Error reading {filepath}: {str(e)}")
+
+    return scraped_urls
+
+
+def confirm_scraping(new_count: int, total_sitemap: int, scraped_count: int, count_arg: Optional[str] = None) -> tuple[bool, Optional[int]]:
+    """Display stats and ask user for confirmation and count.
+
+    Returns:
+        tuple: (should_scrape: bool, count_to_scrape: Optional[int])
+               count_to_scrape is None if 'all' is selected
+    """
+    print("\n" + "=" * 80)
+    print("SCRAPING SUMMARY")
+    print("=" * 80)
+    print(f"Total festivals in sitemap:  {total_sitemap:,}")
+    print(f"Already scraped:             {scraped_count:,}")
+    print(f"New festivals available:     {new_count:,}")
+    print("=" * 80 + "\n")
+
+    try:
+        # Ask for confirmation
+        response = input("Do you want to start scraping? (yes/no): ").strip().lower()
+        if response not in ['yes', 'y']:
+            return False, None
+
+        # Determine count to scrape
+        scrape_count = None
+        if count_arg is not None:
+            # Count provided via command line
+            if count_arg.lower() == 'all':
+                scrape_count = None  # None means all
+                print(f"Scraping all {new_count:,} new festivals")
+            else:
+                try:
+                    scrape_count = int(count_arg)
+                    if scrape_count <= 0:
+                        print("Error: Count must be positive")
+                        return False, None
+                    scrape_count = min(scrape_count, new_count)  # Cap at available
+                    print(f"Scraping {scrape_count:,} new festivals")
+                except ValueError:
+                    print(f"Error: Invalid count '{count_arg}'. Must be a number or 'all'")
+                    return False, None
+        else:
+            # Ask user for count
+            count_input = input(f"How many festivals to scrape? (1-{new_count:,} or 'all'): ").strip().lower()
+            if count_input == 'all':
+                scrape_count = None  # None means all
+            else:
+                try:
+                    scrape_count = int(count_input)
+                    if scrape_count <= 0:
+                        print("Error: Count must be positive")
+                        return False, None
+                    scrape_count = min(scrape_count, new_count)  # Cap at available
+                except ValueError:
+                    print(f"Error: Invalid input '{count_input}'. Must be a number or 'all'")
+                    return False, None
+
+        # Display estimated time
+        actual_count = scrape_count if scrape_count is not None else new_count
+        estimated_seconds = actual_count * DELAY_BETWEEN_FESTIVALS
+        estimated_hours = estimated_seconds / 3600
+
+        if estimated_hours < 1:
+            estimated_minutes = estimated_seconds / 60
+            print(f"Estimated time: ~{estimated_minutes:.1f} minutes")
+        else:
+            print(f"Estimated time: ~{estimated_hours:.1f} hours")
+        print()
+
+        return True, scrape_count
+
+    except (KeyboardInterrupt, EOFError):
+        print("\n")
+        return False, None
 
 
 def extract_section_info(section) -> Dict[str, str]:
@@ -271,21 +529,23 @@ def scrape(url: str, session: requests.Session, retry_count: int = 3) -> Dict[st
 
 
 def scrape_festival_details(
-    urls: List[str], 
-    scrape_from: Optional[int] = 0, 
-    scrape_to: Optional[int] = None
+    urls: List[str],
+    count: Optional[int] = None
 ) -> List[Dict[str, any]]:
-    """Scrape detailed information for each festival."""
-    scrape_to = len(urls) if not scrape_to else scrape_to
-    
-    if scrape_from >= scrape_to:
-        logging.error(f"Invalid range: scrape_from ({scrape_from}) >= scrape_to ({scrape_to})")
+    """Scrape detailed information for each festival.
+
+    Args:
+        urls: List of festival URLs to scrape
+        count: Number of festivals to scrape (None means all)
+    """
+    # Determine how many to scrape
+    scrape_count = len(urls) if count is None else min(count, len(urls))
+
+    if scrape_count <= 0:
+        logging.error("No festivals to scrape")
         return []
 
-    logging.info(
-        f"Starting to scrape details for {scrape_to - scrape_from} festivals "
-        f"(from #{scrape_from} to #{scrape_to - 1})..."
-    )
+    logging.info(f"Starting to scrape details for {scrape_count} festivals...")
 
     festivals_data = []
     session = get_session()
@@ -299,37 +559,47 @@ def scrape_festival_details(
     except Exception as e:
         logging.warning(f"Could not establish initial session: {str(e)}")
     
-    with tqdm(total=scrape_to - scrape_from, desc="Scraping festival details") as pbar:
-        for idx, url in enumerate(urls[scrape_from:scrape_to], start=scrape_from):
+    with tqdm(total=scrape_count, desc="Scraping festival details") as pbar:
+        for idx, url in enumerate(urls[:scrape_count]):
             try:
-                festival_data = {"idx": idx}
+                festival_data = {}
                 festival_data.update(scrape(url, session))
+
+                # Add timestamp
+                festival_data['scraped_at'] = datetime.utcnow().isoformat() + 'Z'
+
                 festivals_data.append(festival_data)
 
                 save_festival(festival_data)
-                
+
                 section_count = len(festival_data.get('sections', []))
                 logging.info(
-                    f"[{idx}] Successfully scraped: {festival_data['title']} "
+                    f"[{idx+1}/{scrape_count}] Successfully scraped: {festival_data['title']} "
                     f"({section_count} sections)"
                 )
-                
+
                 pbar.update(1)
-                
+
                 delay_variation = random.uniform(-3, 3)
                 actual_delay = max(DELAY_BETWEEN_FESTIVALS + delay_variation, 0)
-                
-                if idx < scrape_to - 1:  # Don't delay after last item
+
+                if idx < scrape_count - 1:  # Don't delay after last item
                     time.sleep(actual_delay)
 
             except Exception as e:
-                logging.error(f"[{idx}] Error processing {url.strip()}: {str(e)}")
-                save_festival({"idx": idx, "url": url})
+                logging.error(f"[{idx+1}/{scrape_count}] Error processing {url.strip()}: {str(e)}")
+                save_festival({"url": url})
                 pbar.update(1)
                 # Continue with next festival
                 continue
-    
-    logging.info(f"Successfully scraped {len(festivals_data)} out of {scrape_to - scrape_from} festivals")
+
+    # Close the chunked writer
+    global chunked_writer
+    if chunked_writer:
+        chunked_writer.close()
+        chunked_writer = None  # Reset for next run
+
+    logging.info(f"Successfully scraped {len(festivals_data)} out of {scrape_count} festivals")
     return festivals_data
 
 
@@ -345,16 +615,15 @@ def main():
         description='Scrape festival information from FilmFreeway (robots.txt compliant)'
     )
     parser.add_argument(
-        '--scrape-from', 
-        type=int, 
-        default=0, 
-        help='Start scraping from this festival index (0-based)'
+        '--count', '-c',
+        type=str,
+        default=None,
+        help='Number of new festivals to scrape (or "all" to scrape all new festivals)'
     )
     parser.add_argument(
-        '--scrape-to', 
-        type=int, 
-        default=None, 
-        help='Stop scraping at this festival index (exclusive)'
+        '--yes', '-y',
+        action='store_true',
+        help='Skip confirmation prompt and start scraping'
     )
     parser.add_argument(
         '--debug',
@@ -373,23 +642,64 @@ def main():
     logging.info("=" * 80)
 
     try:
-        with open("input/festivals2.txt", 'r', encoding='utf-8') as f:
-            urls = [line.strip() for line in f if line.strip()]
-        
-        logging.info(f"Loaded {len(urls)} festival URLs from input file")
-        
-        if not urls:
-            logging.error("No URLs found in input file")
-            return
+        # Fetch sitemap URLs or use input file
+        try:
+            sitemap_urls = fetch_sitemap_urls()
+            logging.info(f"Found {len(sitemap_urls)} festivals in sitemap")
+        except Exception as e:
+            logging.error(f"Failed to fetch festivals sitemap: {str(e)}")
+            return 
 
-        festivals_data = scrape_festival_details(urls, args.scrape_from, args.scrape_to)
+        # Load already-scraped URLs
+        logging.info("Checking already scraped festivals...")
+        scraped_urls = load_scraped_urls()
+        logging.info(f"Found {len(scraped_urls)} already scraped festivals")
 
-        logging.info("=" * 80)
-        logging.info(f"Scraping completed! Scraped {len(festivals_data)} festivals successfully.")
-        logging.info("=" * 80)
+        # Find new festivals
+        new_festivals = [url for url in sitemap_urls if url not in scraped_urls]
+        logging.info(f"Found {len(new_festivals)} new festivals to scrape")
 
-    except FileNotFoundError:
-        logging.error("Input file not found. Please create this file with festival URLs.")
+        # Handle count and confirmation
+        if new_festivals:
+            scrape_count = None
+
+            if not args.yes:
+                # Ask for confirmation and count
+                should_scrape, scrape_count = confirm_scraping(
+                    len(new_festivals),
+                    len(sitemap_urls),
+                    len(scraped_urls),
+                    args.count
+                )
+                if not should_scrape:
+                    logging.info("Scraping cancelled by user")
+                    return
+            else:
+                # --yes flag: use count from args or default to all
+                if args.count:
+                    if args.count.lower() == 'all':
+                        scrape_count = None
+                    else:
+                        try:
+                            scrape_count = int(args.count)
+                            scrape_count = min(scrape_count, len(new_festivals))
+                        except ValueError:
+                            logging.error(f"Invalid count '{args.count}'. Must be a number or 'all'")
+                            return
+                else:
+                    scrape_count = None  # Default to all
+
+            # Scrape new festivals
+            festivals_data = scrape_festival_details(new_festivals, scrape_count)
+
+            logging.info("=" * 80)
+            logging.info(f"Scraping completed! Scraped {len(festivals_data)} festivals successfully.")
+            logging.info("=" * 80)
+        else:
+            logging.info("=" * 80)
+            logging.info("All festivals already scraped! Nothing to do.")
+            logging.info("=" * 80)
+
     except KeyboardInterrupt:
         logging.info("\nScraping interrupted by user")
     except Exception as e:

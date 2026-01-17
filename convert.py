@@ -10,7 +10,6 @@ def read_jsonl_to_dataframe(filepath):
                 try:
                     record = json.loads(line)
                     row = {
-                        'idx': record['idx'],
                         'url': record['url'],
                     }
                     if 'title' in record:
