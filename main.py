@@ -18,6 +18,8 @@ import glob
 import os
 from pathlib import Path
 from datetime import datetime
+import platform
+
 
 DELAY_BETWEEN_FESTIVALS = 20
 REQUEST_TIMEOUT = 30
@@ -29,6 +31,21 @@ USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
 ]
+
+
+def get_appropriate_user_agent() -> str:
+    """Select user agent that matches the current platform."""
+    system = platform.system()
+    
+    if system == 'Windows':
+        windows_agents = [ua for ua in USER_AGENTS if 'Windows' in ua]
+        return random.choice(windows_agents)
+    elif system == 'Darwin':  # Mac
+        mac_agents = [ua for ua in USER_AGENTS if 'Macintosh' in ua]
+        return random.choice(mac_agents)
+    else:
+        # Linux or other - use Windows agent as fallback
+        return random.choice([ua for ua in USER_AGENTS if 'Windows' in ua])
 
 
 class ChunkedJSONLWriter:
@@ -151,12 +168,33 @@ def fetch_sitemap_urls(sitemap_url: str = "https://filmfreeway.com/pages/sitemap
 
     for attempt in range(retry_count):
         try:
-            # Rotate user agent for each attempt
-            session.headers['User-Agent'] = random.choice(USER_AGENTS)
+            # Use platform-appropriate user agent
+            session.headers['User-Agent'] = get_appropriate_user_agent()
             session.headers['Referer'] = 'https://filmfreeway.com/'
+            
+            # Add a small delay before first request
+            if attempt == 0:
+                time.sleep(random.uniform(1, 3))
 
-            logging.info(f"Fetching sitemap from {sitemap_url}...")
-            response = session.get(sitemap_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            logging.info(f"Fetching sitemap from {sitemap_url}... (attempt {attempt + 1}/{retry_count})")
+            
+            # Try with verify=True first, fallback to certifi if available
+            try:
+                response = session.get(
+                    sitemap_url, 
+                    timeout=REQUEST_TIMEOUT, 
+                    allow_redirects=True,
+                    verify=True  # Ensure SSL verification
+                )
+            except requests.exceptions.SSLError as ssl_err:
+                logging.warning(f"SSL verification failed: {ssl_err}")
+                # Try with system certificates
+                response = session.get(
+                    sitemap_url, 
+                    timeout=REQUEST_TIMEOUT, 
+                    allow_redirects=True
+                )
+            
             response.raise_for_status()
 
             # Parse as plain text file (one URL per line)
@@ -170,15 +208,23 @@ def fetch_sitemap_urls(sitemap_url: str = "https://filmfreeway.com/pages/sitemap
 
             if status_code == 403:
                 if attempt < retry_count - 1:
-                    wait_time = 15 * (2 ** attempt)
+                    wait_time = 20 * (2 ** attempt)  # Increased from 15
                     logging.warning(
                         f"403 Forbidden for sitemap (attempt {attempt + 1}/{retry_count}). "
+                        f"User-Agent: {session.headers.get('User-Agent')[:50]}... "
                         f"Waiting {wait_time}s before retry..."
                     )
                     time.sleep(wait_time)
+                    # Try establishing session again
+                    try:
+                        session.get('https://filmfreeway.com/', timeout=REQUEST_TIMEOUT)
+                        time.sleep(2)
+                    except:
+                        pass
                     continue
                 else:
                     logging.error(f"Failed to fetch sitemap after {retry_count} attempts: 403 Forbidden")
+                    logging.error(f"Platform: {platform.system()}, Python: {platform.python_version()}")
                     raise
             else:
                 logging.error(f"HTTP {status_code} error for sitemap")
@@ -192,6 +238,11 @@ def fetch_sitemap_urls(sitemap_url: str = "https://filmfreeway.com/pages/sitemap
             else:
                 logging.error(f"Timeout after {retry_count} attempts for sitemap")
                 raise
+
+        except requests.exceptions.SSLError as e:
+            logging.error(f"SSL Error: {str(e)}")
+            logging.error("Try updating certifi: pip install --upgrade certifi")
+            raise
 
         except requests.exceptions.RequestException as e:
             if attempt < retry_count - 1:
@@ -420,8 +471,8 @@ def scrape(url: str, session: requests.Session, retry_count: int = 3) -> Dict[st
     
     for attempt in range(retry_count):
         try:
-            # Rotate user agent for each attempt
-            session.headers['User-Agent'] = random.choice(USER_AGENTS)
+            # Use platform-appropriate user agent
+            session.headers['User-Agent'] = get_appropriate_user_agent()
             
             # Set referer to look like navigation from main site
             session.headers['Referer'] = 'https://filmfreeway.com/'
